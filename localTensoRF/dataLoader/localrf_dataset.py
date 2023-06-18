@@ -32,8 +32,8 @@ class LocalRFDataset(Dataset):
         load_flow=False,
         with_GT_poses=False,
         n_init_frames=7,
-        subsequence=[0, -1],
-        test_skip=10
+        subsequence=[0, -1], # 指定子序列的起始和结尾
+        test_skip=10 # 论文里说：we select every ten frames as a test image
     ):
         """
         spheric_poses: whether the images are taken in a spheric inward-facing manner
@@ -44,7 +44,7 @@ class LocalRFDataset(Dataset):
         self.test_skip = test_skip
         self.root_dir = datadir
         self.split = split
-        self.frames_chunk = max(frames_chunk, n_init_frames)
+        self.frames_chunk = max(frames_chunk, n_init_frames) # 20
         self.downsampling = downsampling
         self.load_depth = load_depth
         self.load_flow = load_flow
@@ -87,7 +87,7 @@ class LocalRFDataset(Dataset):
         for idx, image_path in enumerate(self.image_paths):
             fbase = os.path.splitext(image_path)[0]
             index = int(fbase) if fbase.isnumeric() else idx
-            if index % test_skip == 0:
+            if index % test_skip == 0: # we select every ten frames as a test image，这样并没有将训练数据和测试数据分开呀。
                 self.test_paths.append(image_path)
                 self.test_mask.append(1)
             else:
@@ -112,7 +112,7 @@ class LocalRFDataset(Dataset):
 
         self.active_frames_bounds = [0, 0]
         self.loaded_frames = 0
-        self.activate_frames(n_init_frames)
+        self.activate_frames(n_init_frames) # change active_frames from [0,0] to [0, 5]
 
 
     def activate_frames(self, n_frames=1):
@@ -130,6 +130,9 @@ class LocalRFDataset(Dataset):
         return self.active_frames_bounds[1] < self.num_images
 
     def deactivate_frames(self, first_frame):
+        """
+            从加载的数据集中去除(self.active_frames_bounds[0], self.active_frames_bounds[0]+first_frame)的数据
+        """
         n_frames = first_frame - self.active_frames_bounds[0]
         self.active_frames_bounds[0] = first_frame
 
@@ -210,13 +213,13 @@ class LocalRFDataset(Dataset):
                 "bwd_mask": bwd_mask,
                 "motion_mask": motion_mask,
             }
-
+        # local data: 从self.loaded_frames开始，到self.loaded_frames + n_frames_to_load结束，每次读取self.frames_chunk图像
         n_frames_to_load = min(self.frames_chunk, self.num_images - self.loaded_frames)
         all_data = Parallel(n_jobs=-1, backend="threading")(
             delayed(read_image)(i) for i in range(self.loaded_frames, self.loaded_frames + n_frames_to_load) 
         )
         self.loaded_frames += n_frames_to_load
-        all_rgbs = [data["img"] for data in all_data]
+        all_rgbs = [data["img"] for data in all_data]           # local Data
         all_invdepths = [data["invdepth"] for data in all_data]
         all_fwd_flow = [data["fwd_flow"] for data in all_data]
         all_fwd_mask = [data["fwd_mask"] for data in all_data]
@@ -301,10 +304,14 @@ class LocalRFDataset(Dataset):
         return frame
 
     def sample(self, batch_size, is_refining, optimize_poses, n_views=16):
-        active_test_mask = self.test_mask[self.active_frames_bounds[0] : self.active_frames_bounds[1]]
-        test_ratio = active_test_mask.mean()
+        """
+        Inputs:
+            batch_size: count in per pixel (per ray)
+        """
+        active_test_mask = self.test_mask[self.active_frames_bounds[0] : self.active_frames_bounds[1]] # only sample from the active frames (localRF is learning)
+        test_ratio = active_test_mask.mean()     
         if optimize_poses:
-            train_test_poses = test_ratio > random.uniform(0, 1)
+            train_test_poses = test_ratio > random.uniform(0, 1)    # TODO: what't this
         else:
             train_test_poses = False
 
@@ -312,9 +319,10 @@ class LocalRFDataset(Dataset):
         sample_map = np.arange(
             self.active_frames_bounds[0], 
             self.active_frames_bounds[1], 
-            dtype=np.int64)[inclusion_mask == 1]
+            dtype=np.int64)[inclusion_mask == 1] # sample_map 指的是应该是 当前active frame中可以拿去train的frame编号（去除了用于test的frame编号）
         
-        raw_samples = np.random.randint(0, inclusion_mask.sum(), n_views, dtype=np.int64)
+        # inclusion_mask.sum() 意味着所以可以用于训练的frame个数总和，从中抽取n_views个用于训练
+        raw_samples = np.random.randint(0, inclusion_mask.sum(), n_views, dtype=np.int64) # (n_views)
 
         # Force having the last views during coarse optimization
         if not is_refining and inclusion_mask.sum() > 4:
@@ -323,17 +331,17 @@ class LocalRFDataset(Dataset):
             raw_samples[4] = inclusion_mask.sum() - 3
             raw_samples[5] = inclusion_mask.sum() - 4
 
-        view_ids = sample_map[raw_samples]
+        view_ids = sample_map[raw_samples] # (n_views, 1)
 
-        idx = np.random.randint(0, self.n_px_per_frame, batch_size, dtype=np.int64)
-        idx = idx.reshape(n_views, -1)
-        idx = idx + view_ids[..., None] * self.n_px_per_frame
-        idx = idx.reshape(-1)
+        idx = np.random.randint(0, self.n_px_per_frame, batch_size, dtype=np.int64) # (4096)
+        idx = idx.reshape(n_views, -1)                                              # (16, 256) = (n_views, 256)
+        idx = idx + view_ids[..., None] * self.n_px_per_frame                       # 变换到不同的图像上去，每个图像上都分配256个ray
+        idx = idx.reshape(-1)                                                       # (4096)
 
-        idx_sample = idx - self.active_frames_bounds[0] * self.n_px_per_frame
+        idx_sample = idx - self.active_frames_bounds[0] * self.n_px_per_frame       # 由于deactivate会除去一些加载的数据，所以这里还需要做一个额外的减法
 
         return {
-            "rgbs": self.all_rgbs[idx_sample], 
+            "rgbs": self.all_rgbs[idx_sample], # # (4096, 3)
             "laplacian": self.laplacian[idx_sample], 
             "invdepths": self.all_invdepths[idx_sample] if self.load_depth else None,
             "fwd_flow": self.all_fwd_flow[idx_sample] if self.load_flow else None,
@@ -342,6 +350,6 @@ class LocalRFDataset(Dataset):
             "bwd_mask": self.all_bwd_mask[idx_sample] if self.load_flow else None,
             "motion_mask": self.all_motion_mask[idx_sample],
             "idx": idx,
-            "view_ids": view_ids,
+            "view_ids": view_ids,#  # (n_views, 1) 这次用于训练的图像id
             "train_test_poses": train_test_poses,
         }

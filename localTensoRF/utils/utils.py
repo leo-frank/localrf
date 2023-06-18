@@ -378,6 +378,7 @@ def convert_sdf_samples_to_ply(
     print("saving mesh to %s" % (ply_filename_out))
     ply_data.write(ply_filename_out)
 
+# 输入的旋转矩阵采用了轴角（axis-angle）表示法。这个转换过程我还不是很清楚
 def sixD_to_mtx(r):
     b1 = r[..., 0]
     b1 = b1 / torch.norm(b1, dim=-1)[:, None]

@@ -180,7 +180,7 @@ def reconstruction(args):
     train_dataset = LocalRFDataset(
         f"{args.datadir}",
         split="train",
-        downsampling=args.downsampling,
+        downsampling=args.downsampling, # -1 in default settings
         load_depth=args.loss_depth_weight_inital > 0,
         load_flow=args.loss_flow_weight_inital > 0,
         with_GT_poses=args.with_GT_poses,
@@ -321,8 +321,8 @@ def reconstruction(args):
             test_id=train_test_poses,
         )
 
-        # loss
-        rgb_loss_weights = laplacian * bg_mask
+        # rgb loss
+        rgb_loss_weights = laplacian * bg_mask # 这行是干啥的？？？
 
         loss = 0.25 * ((torch.abs(rgb_map - rgb_train)) * rgb_loss_weights) / rgb_loss_weights.mean()
                
@@ -330,7 +330,7 @@ def reconstruction(args):
         total_loss = loss
         writer.add_scalar("train/rgb_loss", loss, global_step=iteration)
 
-        ## Regularization
+        ## Regularization: flow, depth, tv, l1_loss
         # Get rendered rays schedule
         if local_tensorfs.regularize and args.loss_flow_weight_inital > 0 or args.loss_depth_weight_inital > 0:
             depth_map = depth_map.view(view_ids.shape[0], -1)
@@ -392,19 +392,26 @@ def reconstruction(args):
 
         ## Progressive optimization
         if not local_tensorfs.is_refining:
+            # 什么时候应该开始去refine
+            # 1、已经没有多余的图像，也就是所有的localRF已经构建完毕了。
+            # 2、每个localRF里的100张（n_max_frames）图像都处理完毕后 ，而且每个图像必须处理最少100iter（add_frames_every）
+            # 什么时候应该开始去继续添加image，而不是refine
+            # 1、已经没有多余的图像，也就是所有的localRF已经构建完毕了。
+            # 2、每个localRF里的100张图像都处理完毕后 
             should_refine = (not train_dataset.has_left_frames() or (
                 n_added_frames > args.n_overlap and (
                     local_tensorfs.get_dist_to_last_rf().cpu().item() > args.max_drift
                     or (train_dataset.active_frames_bounds[1] - train_dataset.active_frames_bounds[0]) >= args.n_max_frames
                 )))
             if should_refine and (iteration - last_add_iter) >= args.add_frames_every:
+                # 只有已经把当前的图像优化100轮才应该变为refine状态
                 local_tensorfs.is_refining = True
 
             should_add_frame = train_dataset.has_left_frames()
             should_add_frame &= (iteration - last_add_iter + 1) % args.add_frames_every == 0
 
             should_add_frame &= not should_refine
-            should_add_frame &= not local_tensorfs.is_refining
+            should_add_frame &= not local_tensorfs.is_refining # refine和add是冲突的，只能做一个
             if last_add_rf_iter != 0:
                 should_add_frame &= (iteration - last_add_rf_iter) > (args.add_frames_every * args.n_overlap)
             # Add supervising frames
@@ -416,13 +423,13 @@ def reconstruction(args):
 
         # Add new RF
         if can_add_rf:
-            if train_dataset.has_left_frames():
-                local_tensorfs.append_rf(n_added_frames)
+            if train_dataset.has_left_frames():             # append new local radiance field
+                local_tensorfs.append_rf(n_added_frames)    # 已经添加的n_added_frames只是用来计算blending weight
                 n_added_frames = 0
                 last_add_rf_iter = iteration
 
                 # Remove supervising frames
-                training_frames = (local_tensorfs.blending_weights[:, -1] > 0)
+                training_frames = (local_tensorfs.blending_weights[:, -1] > 0) # 去除掉那些不要的frame
                 train_dataset.deactivate_frames(
                     np.argmax(training_frames.cpu().numpy(), axis=0))
             else:
@@ -483,7 +490,7 @@ def reconstruction(args):
         # Print the current values of the losses.
         if iteration % args.progress_refresh_rate == 0:
             # All poses visualization
-            poses_mtx = local_tensorfs.get_cam2world().detach().cpu()
+            poses_mtx = local_tensorfs.get_cam2world().detach().cpu()       # (N, 3, 4)
             t_w2rf = torch.stack(list(local_tensorfs.world2rf), dim=0).detach().cpu()
             RF_mtx_inv = torch.cat([torch.stack(len(t_w2rf) * [torch.eye(3)]), -t_w2rf.clone()[..., None]], axis=-1)
 

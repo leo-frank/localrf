@@ -18,14 +18,14 @@ def config_parser(cmd=None):
         default=200,
         help="how many iterations to show iters",
     )
-
+    # 论文中写的是： we select every ten frames as a test image. 这的downsampling是啥意思
     parser.add_argument(
         "--downsampling", 
         type=float, 
         default=-1, 
         help="Downsampling ratio for training and testing. Test views rendered throughout optimization will be downsampled further two times."
     )
-
+    # 这个应该是tensorRF model（NeRF model）
     parser.add_argument(
         "--model_name",
         type=str,
@@ -145,7 +145,7 @@ def config_parser(cmd=None):
         help="Create a new RF once the camera pose shifts this ammount w.r.t the last created RF",
     )
     parser.add_argument(
-        "--n_max_frames",
+        "--n_max_frames", # 每一个localRF内部应该有100张图像
         type=int,
         default=100,
         help="Maximum number of frames aded before optimizing a new RF",
@@ -154,14 +154,15 @@ def config_parser(cmd=None):
         "--add_frames_every",
         type=int,
         default=100,
-        help="Number of iterations before adding another frame",
+        help="Number of iterations before adding another frame", # 也就是说，每个frame要优化100个iter
     )
     parser.add_argument(
         "--n_overlap",
         type=int,
         default=30,
         help="Number of frames supervising two neighbour RFs",
-    )
+    ) # This subset contains all the frames during which the radiance field was current,
+    # as well as the preceding 30 frames to provide for some overlap.
 
     # Camera model options
     parser.add_argument("--fov", type=float, default=85.6, help="horizontal FoV in degree")

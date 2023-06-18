@@ -50,6 +50,10 @@ class TensorVMSplit(TensorBase):
         ).to(device)
 
     def get_optparam_groups(self, lr_init_spatialxyz=0.02, lr_init_network=0.001):
+        """
+        Outputs:
+             all parameters this model needs to learn
+        """
         grad_vars = [
             {"params": self.density_line, "lr": lr_init_spatialxyz},
             {"params": self.density_plane, "lr": lr_init_spatialxyz},

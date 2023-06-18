@@ -23,6 +23,9 @@ def ids2pixel_view(W, H, ids):
 def ids2pixel(W, H, ids):
     """
     Regress pixel coordinates from ray indices
+    注意，这里的ids不一定是在n_px_per_frame范围内的，因为我们在sample dataset的时候把idx变换到不同的图像上去，每个图像上都分配256个ray
+    所以有的id很大，这里返回的是对应到图像上的col row，
+    举个例子800*900的图像，一共有720000个像素，像素索引是[0，719999]，那么对于720000这个索引（超出了第一张图乡）来说，也会映射到0（col）,0(row)
     """
     col = ids % W
     row = (ids // W) % H
@@ -83,7 +86,12 @@ class LocalTensorfs(torch.nn.Module):
 
         # Setup pose and camera parameters
         self.r_c2w, self.t_c2w, self.exposure = torch.nn.ParameterList(), torch.nn.ParameterList(), torch.nn.ParameterList()
+        """
+        r_optimizers: rotation optimizer;
+        t_optimizers: translation optimizer;
+        """
         self.r_optimizers, self.t_optimizers, self.exp_optimizers, self.pose_linked_rf = [], [], [], [] 
+        # pose_linked_rf: pose_linked_rf[i] stores the radiance field idx of self.r_c2w[i] and self.t_c2w[i]
         self.blending_weights = torch.nn.Parameter(
             torch.ones([1, 1], device=self.device, requires_grad=False), 
             requires_grad=False,
@@ -108,28 +116,29 @@ class LocalTensorfs(torch.nn.Module):
 
 
         # Setup radiance fields
-        self.tensorfs = torch.nn.ParameterList()
-        self.rf_optimizers, self.rf_iter = [], []
-        self.world2rf = torch.nn.ParameterList()
+        self.tensorfs = torch.nn.ParameterList()        # store all local radiance fields
+        self.rf_optimizers, self.rf_iter = [], []       # rf_optimizers: all localRF's optimizer; rf_iter: ?
+        self.world2rf = torch.nn.ParameterList()        # 这个是干啥的，是不是存放
         self.append_rf()
 
     def append_rf(self, n_added_frames=1):
         self.is_refining = False
         if len(self.tensorfs) > 0:
-            n_overlap = min(n_added_frames, self.n_overlap, self.blending_weights.shape[0] - 1)
+            n_overlap = min(n_added_frames, self.n_overlap, self.blending_weights.shape[0] - 1) # 重叠的帧数
             weights_overlap = 1 / n_overlap + torch.arange(
                 0, 1, 1 / n_overlap
-            )
+            ) # 用于表示重叠区域内的权重变化。
             self.blending_weights.requires_grad = False
-            self.blending_weights[-n_overlap :, -1] = 1 - weights_overlap
-            new_blending_weights = torch.zeros_like(self.blending_weights[:, 0:1])
+            self.blending_weights[-n_overlap :, -1] = 1 - weights_overlap # 越靠近localRF中心的frame权重越大
+            # new_blending_weights.shape 为 (M, 1)。其中，M 表示行数，表示帧数；N 表示列数，表示权重维度。
+            new_blending_weights = torch.zeros_like(self.blending_weights[:, 0:1]) # (M, 1) # new_blending_weights指的是第二个localRF的权重
             new_blending_weights[-n_overlap :, 0] = weights_overlap
             self.blending_weights = torch.nn.Parameter(
                 torch.cat([self.blending_weights, new_blending_weights], dim=1),
                 requires_grad=False,
             )
-            world2rf = -self.t_c2w[-1].clone().detach()
-        else:
+            world2rf = -self.t_c2w[-1].clone().detach()         # the location of last estimated camera pose, why minus ? 
+        else:   # first localRF
             world2rf = torch.zeros(3, device=self.device)
 
         self.tensorfs.append(TensorVMSplit(device=self.device, **self.tensorf_args))
@@ -144,21 +153,21 @@ class LocalTensorfs(torch.nn.Module):
         self.rf_optimizers.append(torch.optim.Adam(grad_vars, betas=(0.9, 0.99)))
    
     def append_frame(self):
-        if len(self.r_c2w) == 0:
-            self.r_c2w.append(torch.eye(3, 2, device=self.device))
+        if len(self.r_c2w) == 0: # the first initial frame,
+            self.r_c2w.append(torch.eye(3, 2, device=self.device)) # 轴角（axis-angle）表示法。在这种表示法中，旋转矩阵通过一个单位轴向量和一个旋转角度来描述旋转操作。其中，r[..., 0] 是单位轴向量，r[..., 1] 是旋转角度。
             self.t_c2w.append(torch.zeros(3, device=self.device))
 
             self.pose_linked_rf.append(0)            
-        else:
-            self.r_c2w.append(mtx_to_sixD(sixD_to_mtx(self.r_c2w[-1].clone().detach()[None]))[0])
+        else: # initialize the new pose (index p + 1) using the current frame at the end of the trajectory
+            self.r_c2w.append(mtx_to_sixD(sixD_to_mtx(self.r_c2w[-1].clone().detach()[None]))[0]) # TODO: 为什么来来回回转换？
             self.t_c2w.append(self.t_c2w[-1].clone().detach())
 
             self.blending_weights = torch.nn.Parameter(
-                torch.cat([self.blending_weights, self.blending_weights[-1:, :]], dim=0),
+                torch.cat([self.blending_weights, self.blending_weights[-1:, :]], dim=0), # (M, N) -> (M+1, N)
                 requires_grad=False,
             )
 
-            rf_ind = int(torch.nonzero(self.blending_weights[-1, :])[0])
+            rf_ind = int(torch.nonzero(self.blending_weights[-1, :])[0]) # 最后一行非零元素的索引 ？？？
             self.pose_linked_rf.append(rf_ind)
                 
         self.exposure.append(torch.eye(3, 3, device=self.device))
@@ -175,6 +184,9 @@ class LocalTensorfs(torch.nn.Module):
         self.exp_optimizers.append(torch.optim.Adam([self.exposure[-1]], betas=(0.9, 0.99), lr=self.lr_exposure_init)) 
 
     def optimizer_step_poses_only(self, loss):
+        """
+        update all parameters about pose, i.e. self.r_optimizers, self.t_optimizers
+        """
         for idx in range(len(self.r_optimizers)):
             if self.pose_linked_rf[idx] == len(self.rf_iter) - 1 and self.rf_iter[-1] < self.n_iters:
                 self.r_optimizers[idx].zero_grad()
@@ -189,6 +201,9 @@ class LocalTensorfs(torch.nn.Module):
                 self.t_optimizers[idx].step()
                 
     def optimizer_step(self, loss, optimize_poses):
+        """
+        self.r_optimizers, self.t_optimizers, self.exp_optimizers
+        """
         if self.rf_iter[-1] == 0:
             self.lr_factor = 1
             self.n_iters = self.n_iters_per_frame
@@ -265,6 +280,7 @@ class LocalTensorfs(torch.nn.Module):
             reso_mask = (self.tensorfs[-1].gridSize / 2).int()
             self.tensorfs[-1].updateAlphaMask(tuple(reso_mask))
 
+        # Update pose related
         for idx in range(len(self.r_optimizers)):
             if self.pose_linked_rf[idx] == len(self.rf_iter) - 1 and self.rf_iter[-1] < self.n_iters:
                 # Optimize poses
@@ -275,7 +291,7 @@ class LocalTensorfs(torch.nn.Module):
                 if self.lr_exposure_init > 0:
                     self.exp_optimizers[idx].step()
         
-        # Optimize intrinsics
+        # Optimize intrinsics 为什么要优化内参？
         if (
             self.lr_i_init > 0 and 
             self.blending_weights.shape[1] == 1 and
@@ -290,6 +306,11 @@ class LocalTensorfs(torch.nn.Module):
         return can_add_rf
 
     def get_cam2world(self, view_ids=None, starting_id=0):
+        """
+        return all poses we learned in matrix format
+        Outputs:
+            (N, 3, 4)
+        """
         if view_ids is not None:
             r_c2w = torch.stack([self.r_c2w[view_id] for view_id in view_ids], dim=0)
             t_c2w = torch.stack([self.t_c2w[view_id] for view_id in view_ids], dim=0)
@@ -376,7 +397,7 @@ class LocalTensorfs(torch.nn.Module):
 
     def focal(self, W):
         return self.init_focal * self.focal_offset * W / self.W 
-    def center(self, W, H):
+    def center(self, W, H): # 这个函数就是返回（W/2, H/2）
         return torch.Tensor([W, H]).to(self.center_rel) * self.center_rel
 
     def forward(
@@ -395,43 +416,43 @@ class LocalTensorfs(torch.nn.Module):
         floater_thresh=0,
     ):
         i, j = ids2pixel(W, H, ray_ids)
-        directions = get_ray_directions_lean(i, j, self.focal(W), self.center(W, H))
+        directions = get_ray_directions_lean(i, j, self.focal(W), self.center(W, H)) # 得到所有在各自坐标轴下的direction（相机坐标系），还没有变换到世界坐标系
 
         if blending_weights is None:
-            blending_weights = self.blending_weights[view_ids].clone()
+            blending_weights = self.blending_weights[view_ids].clone() # (n_views, N), 一行的每一个元素代表了某个localrf对这个view的weights
         if cam2world is None:
-            cam2world = self.get_cam2world(view_ids)
+            cam2world = self.get_cam2world(view_ids)    # 得到n_views个图像的位姿（当然，我们要训练这些个位姿） (N, 3, 4)
         if world2rf is None:
             world2rf = self.world2rf
 
         # Train a single RF at a time
         if is_train:
-            blending_weights[:, -1] = 1
+            blending_weights[:, -1] = 1             # 只用最后一个localRF对n_views进行训练，其他的localRF不参与训练？？奇怪，这好像不符合原文的blending定义
             blending_weights[:, :-1] = 0
 
         if is_train:
-            active_rf_ids = [len(self.tensorfs) - 1]
+            active_rf_ids = [len(self.tensorfs) - 1]    # 只把最后一个localRF看做是active的
         else:
-            active_rf_ids = torch.nonzero(torch.sum(blending_weights, dim=0))[:, 0].tolist()
-        ij = torch.stack([i, j], dim=-1)
+            active_rf_ids = torch.nonzero(torch.sum(blending_weights, dim=0))[:, 0].tolist() # 求出所有参与训练的localRF
+        ij = torch.stack([i, j], dim=-1) # (N, 2)
         if len(active_rf_ids) == 0:
             print("****** No valid RF")
             return torch.ones([ray_ids.shape[0], 3]), torch.ones_like(ray_ids).float(), torch.ones_like(ray_ids).float(), directions, ij
 
-        cam2rfs = {}
+        cam2rfs = {} # 对于每个localRF，其看到的n_views个图像位姿是不一样的，中间有一些平移上的差别
         for rf_id in active_rf_ids:
             cam2rf = cam2world.clone()
-            cam2rf[:, :3, 3] += world2rf[rf_id]
+            cam2rf[:, :3, 3] += world2rf[rf_id] # world2rf存放着rf_id与对应center的对应关系，是一个负数
 
             cam2rfs[rf_id] = cam2rf
 
         for key in cam2rfs:
             cam2rfs[key] = cam2rfs[key].repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
         blending_weights_expanded = blending_weights.repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
-        rgbs = torch.zeros_like(directions) 
-        depth_maps = torch.zeros_like(directions[..., 0]) 
-        N_rays_all = ray_ids.shape[0]
-        chunk = chunk // len(active_rf_ids)
+        rgbs = torch.zeros_like(directions)  # (B, 3)
+        depth_maps = torch.zeros_like(directions[..., 0])  # (B, 1)
+        N_rays_all = ray_ids.shape[0] # (B)
+        chunk = chunk // len(active_rf_ids) # 似乎Batch=4096要比chunk还要小？？我不确定
         for chunk_idx in range(N_rays_all // chunk + int(N_rays_all % chunk > 0)):
             if chunk_idx != 0:
                 torch.cuda.empty_cache()
@@ -441,6 +462,7 @@ class LocalTensorfs(torch.nn.Module):
             ]
 
             for rf_id in active_rf_ids:
+                # 每个localRF都要去训练输入的ray
                 blending_weight_chunk = blending_weights_chunk[:, rf_id]
                 cam2rf = cam2rfs[rf_id][chunk_idx * chunk : (chunk_idx + 1) * chunk]
 
@@ -458,14 +480,14 @@ class LocalTensorfs(torch.nn.Module):
 
                 rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
                     rgbs[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                    rgb_map_t * blending_weight_chunk[..., None]
+                    rgb_map_t * blending_weight_chunk[..., None] # 注意这里，是有混合过程的
                 )
                 depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] = (
                     depth_maps[chunk_idx * chunk : (chunk_idx + 1) * chunk] + 
-                    depth_map_t * blending_weight_chunk
+                    depth_map_t * blending_weight_chunk # 注意这里，是有混合过程的
                 )
 
-        if self.lr_exposure_init > 0:
+        if self.lr_exposure_init > 0:  # 曝光补偿，曝光补偿的实现好像就是很简单，只是乘上了一个系数？
             # TODO: cleanup
             if test_id:
                 view_ids_m = torch.maximum(view_ids - 1, torch.tensor(0, device=view_ids.device))
@@ -481,6 +503,6 @@ class LocalTensorfs(torch.nn.Module):
                 
             exposure = exposure.repeat_interleave(ray_ids.shape[0] // view_ids.shape[0], dim=0)
             rgbs = torch.bmm(exposure, rgbs[..., None])[..., 0]
-        rgbs = rgbs.clamp(0, 1)
+        rgbs = rgbs.clamp(0, 1) # 我不确定这会带来多大的影响。毕竟之前没有用过clamp
 
         return rgbs, depth_maps, directions, ij
